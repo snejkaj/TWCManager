@@ -31,6 +31,8 @@ class TWCManagerApp:
     slaves: dict[str, SlaveState] = field(default_factory=dict)
     meter: PowerMeterProvider | None = None
     transport: TwcTransport | None = None
+    meter_degraded: bool = False
+    last_meter_error: str = ""
 
     def setup_meter(self) -> None:
         if self.settings.tibber.enabled:
@@ -78,7 +80,18 @@ class TWCManagerApp:
             safety_margin_amps=self.settings.safety_margin_amps,
         )
 
-    def _distribute(self, target_total: float) -> None:
+    def degraded_target(self) -> float:
+        """Return a conservative total charging target when live meter data is unavailable."""
+        installation_limit = min(
+            self.settings.wiring_max_amps_all_twcs,
+            max(0.0, self.settings.main_fuse_amps - self.settings.safety_margin_amps),
+        )
+        target = min(max(0.0, self.settings.degraded_mode_max_amps), installation_limit)
+        if 0 < target < self.settings.min_amps_per_twc:
+            return 0.0
+        return float(int(target))
+
+    def _distribute(self, target_total: float, force: bool = False) -> None:
         if not self.slaves:
             return
 
@@ -90,6 +103,11 @@ class TWCManagerApp:
             offered = base + (1 if i < remainder else 0)
             if 0 < offered < self.settings.min_amps_per_twc:
                 offered = 0
+            if force:
+                slave.amps_offered = float(offered)
+                slave.offer_policy.last_offered_amps = float(offered)
+                slave.offer_policy.last_change_ts = time.time()
+                continue
             slave.amps_offered = enforce_offer_policy(
                 desired_amps=float(offered),
                 min_amps_per_twc=self.settings.min_amps_per_twc,
@@ -98,11 +116,19 @@ class TWCManagerApp:
 
     def tick(self) -> tuple[MeterReading, float]:
         reading = MeterReading(grid_power_w=0.0, voltage_v=230.0)
-        if self.meter is not None:
+        try:
+            if self.meter is None:
+                raise RuntimeError("no power meter configured")
             reading = self.meter.get_reading()
+            target_total = self.recalc_target(reading)
+            self.meter_degraded = False
+            self.last_meter_error = ""
+        except Exception as exc:
+            self.meter_degraded = True
+            self.last_meter_error = str(exc)
+            target_total = self.degraded_target()
 
-        target_total = self.recalc_target(reading)
-        self._distribute(target_total)
+        self._distribute(target_total, force=self.meter_degraded)
         return reading, target_total
 
     def process_protocol_once(self) -> int:
@@ -132,6 +158,7 @@ class TWCManagerApp:
                 msg_count = self.process_protocol_once() if with_serial else 0
                 per_slave = 0.0 if not self.slaves else target_total / len(self.slaves)
                 print(
+                    f"mode={'degraded' if self.meter_degraded else 'normal'}, "
                     f"grid={reading.grid_amps:.1f}A, charge={self.total_charging_amps():.1f}A, "
                     f"target_total={target_total:.1f}A, per_slave={per_slave:.1f}A, "
                     f"rx_msgs={msg_count}"

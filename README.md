@@ -15,3 +15,20 @@ python3.14 -m twcmanager --serial
 ```
 
 `TWCManager.py` is kept only as a compatibility wrapper for `python3.14 TWCManager.py`.
+
+## Offline and degraded operation
+
+The control loop is designed to keep running without internet access. If the live power meter is unavailable, TWCManager enters degraded mode and uses `degraded_mode_max_amps` from `settings.json` as a conservative total charging limit. The default is `0.0`, which stops charging unless you explicitly configure a safe offline limit for your installation.
+
+Example:
+
+```json
+{
+  "degraded_mode_max_amps": 8.0,
+  "main_fuse_amps": 25.0,
+  "min_amps_per_twc": 6.0,
+  "safety_margin_amps": 2.0,
+  "wiring_max_amps_all_twcs": 40.0,
+  "wiring_max_amps_per_twc": 40.0
+}
+```

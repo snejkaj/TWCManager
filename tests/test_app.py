@@ -15,6 +15,22 @@ class StaticMeter(PowerMeterProvider):
         return self.reading
 
 
+class FailingMeter(PowerMeterProvider):
+    def get_reading(self) -> MeterReading:
+        raise RuntimeError("meter offline")
+
+
+class RecoveringMeter(PowerMeterProvider):
+    def __init__(self):
+        self.calls = 0
+
+    def get_reading(self) -> MeterReading:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("temporary meter outage")
+        return MeterReading(grid_power_w=2300, voltage_v=230)
+
+
 class FakeSerial:
     def __init__(self, read_bytes: bytes = b""):
         self._buf = bytearray(read_bytes)
@@ -42,6 +58,68 @@ class TestApp(unittest.TestCase):
         _, target = app.tick()
         self.assertEqual(target, 13.0)
         self.assertEqual(app.slaves["1"].amps_offered + app.slaves["2"].amps_offered, 13.0)
+
+    def test_no_meter_uses_safe_degraded_zero_by_default(self):
+        app = TWCManagerApp(settings=Settings(min_amps_per_twc=6))
+        app.slaves = {"1": SlaveState("1")}
+
+        _, target = app.tick()
+
+        self.assertEqual(target, 0.0)
+        self.assertEqual(app.slaves["1"].amps_offered, 0.0)
+        self.assertTrue(app.meter_degraded)
+        self.assertIn("no power meter", app.last_meter_error)
+
+    def test_meter_failure_uses_configured_degraded_limit(self):
+        app = TWCManagerApp(
+            settings=Settings(
+                main_fuse_amps=25,
+                min_amps_per_twc=6,
+                degraded_mode_max_amps=8,
+            )
+        )
+        app.slaves = {"1": SlaveState("1")}
+        app.meter = FailingMeter()
+
+        _, target = app.tick()
+
+        self.assertEqual(target, 8.0)
+        self.assertEqual(app.slaves["1"].amps_offered, 8.0)
+        self.assertTrue(app.meter_degraded)
+        self.assertEqual(app.last_meter_error, "meter offline")
+
+    def test_degraded_zero_overrides_anti_flap_immediately(self):
+        app = TWCManagerApp(settings=Settings(main_fuse_amps=25, min_amps_per_twc=6))
+        app.slaves = {"1": SlaveState("1")}
+        app.meter = StaticMeter(MeterReading(grid_power_w=2300, voltage_v=230))
+
+        _, normal_target = app.tick()
+        app.meter = FailingMeter()
+        _, degraded_target = app.tick()
+
+        self.assertEqual(normal_target, 13.0)
+        self.assertEqual(degraded_target, 0.0)
+        self.assertEqual(app.slaves["1"].amps_offered, 0.0)
+        self.assertTrue(app.meter_degraded)
+
+    def test_meter_recovery_clears_degraded_mode(self):
+        app = TWCManagerApp(
+            settings=Settings(
+                main_fuse_amps=25,
+                min_amps_per_twc=6,
+                degraded_mode_max_amps=8,
+            )
+        )
+        app.slaves = {"1": SlaveState("1")}
+        app.meter = RecoveringMeter()
+
+        _, degraded_target = app.tick()
+        _, recovered_target = app.tick()
+
+        self.assertEqual(degraded_target, 8.0)
+        self.assertEqual(recovered_target, 13.0)
+        self.assertFalse(app.meter_degraded)
+        self.assertEqual(app.last_meter_error, "")
 
     def test_handle_protocol_payload_updates_slave(self):
         app = TWCManagerApp(settings=Settings())
